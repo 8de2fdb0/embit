@@ -341,150 +341,7 @@ class ShareSet:
                 more_data.append((i, cls.interpolate(i, share_data)))
         return more_data
 
-    @staticmethod
-    def generate_shares(
-        seed, k, n, passphrase=b"", extendable=True, exponent=0, identifier=-1, randint=secure_randint,
-    ):
-        """
-        Generates a list of SLIP39 mnemonics.
-
-        Parameters
-        ----------
-        seed: bytes 
-            Random 128 or 256 bit seed.
-        k: int
-            Group threshold.
-        n: int
-            Group size.
-        passphrase: bytes, optional
-            Passphrase used to encrypyt the seed. Default to "".
-        extendable: bool, optionl
-            Enables extendable SLIP39 shamir shares, Default to False.
-        exponent: int, optional
-            Defines iteration exponent for pbkdf2_hmac when seed is encrypted with a passphrase. Default to 0.
-        identifier: int, optional
-            Group identifier, must be between 0 and 32767, if set to -1 a radom value is generated. Default to -1.
-        randint: Callable[[int], [int]], optional
-            A function that takes a lower and upper bound and returns a random value within the bound. Default to embit.misc.secure_randint.
-        
-        Returns
-        -------
-        List[str]
-            A list of SLIP39 share mnemonics.
-        """
-        
-        num_bits = len(seed) * 8
-        if num_bits not in (128, 256):
-            raise ValueError("mnemonic must be 12 or 24 words")
-
-        # generate id if set to -1
-        id = identifier if identifier > -1 & identifier < 32768 else randint(0, 32767)
-
-        # encrypt secret with passphrase
-        encrypted = ShareSet.encrypt(seed, id, extendable, exponent, passphrase)
-        # split encrypted payload and create shares
-        shares = []
-        data = ShareSet.split_secret(encrypted, k, n, randint=randint)
-        for group_index, share_bytes in data:
-            share = Share(
-                share_bit_length=num_bits,
-                id=id,
-                extendable=extendable,
-                exponent=exponent,
-                group_index=group_index,
-                group_threshold=k,
-                group_count=n,
-                member_index=0,
-                member_threshold=1,
-                value=int.from_bytes(share_bytes, "big"),
-            )
-            shares.append(share.mnemonic())
-        return shares
-
-    @staticmethod
-    def load(share_mnemonics, passphrase=b""):
-        """
-        Load ShareSet.
-
-        Parameter
-        ---------
-        share_mnemonics: List[str]
-            A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
-        passphrase: bytes, optional
-            Passphrase used to encrypyt the seed. Default to "".
-     
-        Returns
-        -------
-        ShareSet
-            The loaded ShareSet.
-        """
-
-        shares = [Share.parse(m) for m in share_mnemonics]
-        return ShareSet(shares)
-
-    @staticmethod
-    def update_shares(
-        share_mnemonics, new_k, new_n, passphrase=b"", randint=secure_randint,
-    ):
-        """
-        Updates a extendable SLIP39 shamir secret.
-
-        Parameter
-        --------
-        share_mnemonics: List[str]
-            A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
-        new_k: int
-            New group threshold.
-        new_n: int
-            New group size.
-        passphrase: bytes, optional
-            Passphrase used to encrypyt the seed. Default to "".
-        randint: Callable[[int], [int]], optional
-            A function that takes a lower and upper bound and returns a random value within the bound. Default to embit.misc.secure_randint.
-     
-        Returns
-        -------
-        List[str]
-            A list of SLIP39 share mnemonics with the updated group parameters.
-        """
-
-        share_set = ShareSet.load(share_mnemonics)
-        if not share_set.extendable:
-            raise ValueError("Cannot update extendable share sets")
-        secret = share_set.recover(passphrase)
-        
-        # generate a new identifier different from the old one
-        new_identifier = share_set.id
-        while new_identifier == share_set.id:
-            new_identifier = randint(0, 32767)
-
-        return ShareSet.generate_shares(
-            secret, new_k, new_n, passphrase, True, share_set.exponent, new_identifier, randint
-        )
-
-    @staticmethod
-    def recover_seed(share_mnemonics, passphrase=b""):
-        """
-        Recovers the seed.
-        
-                Parameter
-        --------
-        share_mnemonics: List[str]
-            A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
-        passphrase: bytes, optional
-            Passphrase used to encrypyt the seed. Default to "".
-
-        Returns
-        -------
-        bytes
-            The seed, 128 or 256 bit value.
-        """
-
-        share_set = ShareSet.load(share_mnemonics)
-        return share_set.recover(passphrase)
-
 ShareSet._load()
-
 
 def slip39_generate_shares(
     seed, k, n, passphrase=b"", extendable=True, exponent=0, identifier=-1, randint=secure_randint,
@@ -560,7 +417,6 @@ def slip39_load_share_set(share_mnemonics):
     shares = [Share.parse(m) for m in share_mnemonics]
     return ShareSet(shares)
 
-@staticmethod
 def slip39_update_shares(
     share_mnemonics, new_k, new_n, passphrase=b"", randint=secure_randint,
 ):
@@ -584,7 +440,7 @@ def slip39_update_shares(
     List[str]
         A list of SLIP39 share mnemonics with the updated group parameters.
     """
-    share_set = ShareSet.load(share_mnemonics)
+    share_set = slip39_load_share_set(share_mnemonics)
     if not share_set.extendable:
         raise ValueError("Cannot update extendable share sets")
     secret = share_set.recover(passphrase)
@@ -593,7 +449,7 @@ def slip39_update_shares(
     new_identifier = share_set.id
     while new_identifier == share_set.id:
         new_identifier = randint(0, 32767)
-    return ShareSet.generate_shares(
+    return slip39_generate_shares(
         secret, new_k, new_n, passphrase, True, share_set.exponent, new_identifier, randint
     )
 
@@ -612,5 +468,5 @@ def slip39_recover_seed(share_mnemonics, passphrase=b""):
     bytes
         The seed, 128 or 256 bit value.
     """
-    share_set = ShareSet.load(share_mnemonics)
+    share_set = slip39_load_share_set(share_mnemonics)
     return share_set.recover(passphrase)

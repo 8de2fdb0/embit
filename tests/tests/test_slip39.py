@@ -415,7 +415,7 @@ class Slip39Test(TestCase):
 
         for seed, expected_bip39_mnemonic in test_cases:
             for k, n in ((2, 3), (3, 5), (5, 5), (9, 9), (13, 15), (2, 8)):
-                slip39_mnemonics = ShareSet.generate_shares(
+                slip39_mnemonics = slip39_generate_shares(
                     unhexlify(seed), k, n, passphrase=passphrase, exponent=2
                 )
                 self.assertEqual(
@@ -423,7 +423,7 @@ class Slip39Test(TestCase):
                     unhexlify(seed),
                 )
 
-                bip39_mnemonic = mnemonic_from_bytes(ShareSet.recover_seed(slip39_mnemonics, passphrase=passphrase))
+                bip39_mnemonic = mnemonic_from_bytes(slip39_recover_seed(slip39_mnemonics, passphrase=passphrase))
                 self.assertEqual(
                     bip39_mnemonic,
                     expected_bip39_mnemonic,
