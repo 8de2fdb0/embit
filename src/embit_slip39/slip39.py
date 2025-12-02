@@ -1,9 +1,7 @@
 import hmac
 import hashlib
-from .bip39 import mnemonic_from_bytes, mnemonic_to_bytes
-from .misc import secure_randint
-from .wordlists.slip39 import SLIP39_WORDS
-
+from embit.misc import secure_randint
+from .wordlist import SLIP39_WORDS
 
 # functions for SLIP39 checksum
 def rs1024_polymod(values):
@@ -28,30 +26,48 @@ def rs1024_polymod(values):
     return chk
 
 
-def rs1024_verify_checksum(cs, data):
+def cs_bstring(extendable: bool):
+    if extendable:
+        return b"shamir_extendable"
+    else:
+        return b"shamir"
+
+
+def rs1024_verify_checksum(extendable: bool, data):
+    cs = cs_bstring(extendable)
     return rs1024_polymod([x for x in cs] + data) == 1
 
 
-def rs1024_create_checksum(cs, data):
+def rs1024_create_checksum(extendable: bool, data):
+    cs = cs_bstring(extendable)
     values = [x for x in cs] + data
     polymod = rs1024_polymod(values + [0, 0, 0]) ^ 1
     return [(polymod >> 10 * (2 - i)) & 1023 for i in range(3)]
 
 
+def _get_salt(id, extendable):
+    if extendable:
+        return bytes()
+    else:
+        return b"shamir" + id.to_bytes(2, "big")
+
+
 # function for encryption/decryption
-def _crypt(payload, id, exponent, passphrase, indices):
+def _crypt(payload, id, extendable, exponent, passphrase, indices):
     if len(payload) % 2:
         raise ValueError("payload should be an even number of bytes")
     else:
         half = len(payload) // 2
     left = payload[:half]
     right = payload[half:]
-    salt = b"shamir" + id.to_bytes(2, "big")
+    salt = _get_salt(id, extendable)
     for i in indices:
         f = hashlib.pbkdf2_hmac(
             "sha256",
             i + passphrase,
             salt + right,
+            # BUG: should be 10000
+            # see: https://github.com/satoshilabs/slips/blob/master/slip-0039.md#format-of-the-share-mnemonic
             2500 << exponent,
             half,
         )
@@ -64,6 +80,7 @@ class Share:
         self,
         share_bit_length,
         id,
+        extendable,
         exponent,
         group_index,
         group_threshold,
@@ -74,6 +91,7 @@ class Share:
     ):
         self.share_bit_length = share_bit_length
         self.id = id
+        self.extendable = extendable
         self.exponent = exponent
         self.group_index = group_index
         if group_index < 0 or group_index > 15:
@@ -100,10 +118,11 @@ class Share:
         # convert mnemonic into bits
         words = mnemonic.split()
         indices = [SLIP39_WORDS.index(word) for word in words]
-        if not rs1024_verify_checksum(b"shamir", indices):
-            raise ValueError("Invalid Checksum")
         id = (indices[0] << 5) | (indices[1] >> 5)
-        exponent = indices[1] & 31
+        extendable =  bool((indices[1] >> 4) & 1)
+        if not rs1024_verify_checksum(extendable, indices):
+            raise ValueError("Invalid Checksum")
+        exponent = indices[1] & 0x0F
         group_index = indices[2] >> 6
         group_threshold = ((indices[2] >> 2) & 15) + 1
         group_count = (((indices[2] & 3) << 2) | (indices[3] >> 8)) + 1
@@ -120,6 +139,7 @@ class Share:
         return cls(
             share_bit_length,
             id,
+            extendable,
             exponent,
             group_index,
             group_threshold,
@@ -130,7 +150,7 @@ class Share:
         )
 
     def mnemonic(self):
-        all_bits = (self.id << 5) | self.exponent
+        all_bits = (self.id << 5) | self.extendable << 4 | self.exponent
         all_bits <<= 4
         all_bits |= self.group_index
         all_bits <<= 4
@@ -148,7 +168,7 @@ class Share:
         indices = [
             (all_bits >> 10 * (num_words - i - 1)) & 1023 for i in range(num_words)
         ]
-        checksum = rs1024_create_checksum(b"shamir", indices)
+        checksum = rs1024_create_checksum(self.extendable, indices)
         return " ".join([SLIP39_WORDS[index] for index in indices + checksum])
 
 
@@ -174,6 +194,10 @@ class ShareSet:
             ids = {s.id for s in shares}
             if len(ids) != 1:
                 raise TypeError("Shares are from different secrets")
+            # check that the extendable flags are the same
+            extendable = {s.extendable for s in shares}
+            if len(extendable) != 1:
+                raise TypeError("Shares should have the same extendable flag")
             # check that the exponents are the same
             exponents = {s.exponent for s in shares}
             if len(exponents) != 1:
@@ -196,7 +220,8 @@ class ShareSet:
             if len(xs) != len(shares):
                 raise ValueError("Share indices should be unique")
         self.id = shares[0].id
-        self.salt = b"shamir" + self.id.to_bytes(2, "big")
+        self.extendable = shares[0].extendable
+        self.salt = _get_salt(self.id, self.extendable)
         self.exponent = shares[0].exponent
         self.group_threshold = shares[0].group_threshold
         self.group_count = shares[0].group_count
@@ -205,13 +230,13 @@ class ShareSet:
     def decrypt(self, secret, passphrase=b""):
         # decryption does the reverse of encryption
         indices = (b"\x03", b"\x02", b"\x01", b"\x00")
-        return _crypt(secret, self.id, self.exponent, passphrase, indices)
+        return _crypt(secret, self.id, self.extendable, self.exponent, passphrase, indices)
 
     @classmethod
-    def encrypt(cls, payload, id, exponent, passphrase=b""):
+    def encrypt(cls, payload, id, extendable, exponent, passphrase=b""):
         # encryption goes from 0 to 3 in bytes
         indices = (b"\x00", b"\x01", b"\x02", b"\x03")
-        return _crypt(payload, id, exponent, passphrase, indices)
+        return _crypt(payload, id, extendable, exponent, passphrase, indices)
 
     @classmethod
     def interpolate(cls, x, share_data):
@@ -246,7 +271,7 @@ class ShareSet:
         return hmac.new(r, shared_secret, "sha256").digest()[:4]
 
     @classmethod
-    def recover_secret(cls, share_data):
+    def recover_secret_from_share_data(cls, share_data):
         """return a shared secret from a list of shares"""
         shared_secret = cls.interpolate(255, share_data)
         digest_share = cls.interpolate(254, share_data)
@@ -277,12 +302,12 @@ class ShareSet:
                 raise ValueError("Not enough shares")
             else:
                 member_data = [(share.member_index, share.bytes) for share in group]
-                share_data.append((i, self.recover_secret(member_data)))
+                share_data.append((i, self.recover_secret_from_share_data(member_data)))
         if self.group_threshold == 1:
             return self.decrypt(share_data[0][1], passphrase)
         elif self.group_threshold > len(share_data):
             raise ValueError("Not enough shares")
-        shared_secret = self.recover_secret(share_data)
+        shared_secret = self.recover_secret_from_share_data(share_data)
         return self.decrypt(shared_secret, passphrase)
 
     @classmethod
@@ -316,47 +341,132 @@ class ShareSet:
                 more_data.append((i, cls.interpolate(i, share_data)))
         return more_data
 
-    @classmethod
-    def generate_shares(
-        cls, mnemonic, k, n, passphrase=b"", exponent=0, randint=secure_randint
-    ):
-        """Takes a BIP39 mnemonic along with k, n, passphrase and exponent.
-        Returns a list of SLIP39 mnemonics, any k of of which, along with the passphrase, recover the secret
-        """
-        # convert mnemonic to a shared secret
-        secret = mnemonic_to_bytes(mnemonic)
-        num_bits = len(secret) * 8
-        if num_bits not in (128, 256):
-            raise ValueError("mnemonic must be 12 or 24 words")
-        # generate id
-        id = randint(0, 32767)
-        # encrypt secret with passphrase
-        encrypted = cls.encrypt(secret, id, exponent, passphrase)
-        # split encrypted payload and create shares
-        shares = []
-        data = cls.split_secret(encrypted, k, n, randint=randint)
-        for group_index, share_bytes in data:
-            share = Share(
-                share_bit_length=num_bits,
-                id=id,
-                exponent=exponent,
-                group_index=group_index,
-                group_threshold=k,
-                group_count=n,
-                member_index=0,
-                member_threshold=1,
-                value=int.from_bytes(share_bytes, "big"),
-            )
-            shares.append(share.mnemonic())
-        return shares
-
-    @classmethod
-    def recover_mnemonic(cls, share_mnemonics, passphrase=b""):
-        """Recovers the BIP39 mnemonic from a bunch of SLIP39 mnemonics"""
-        shares = [Share.parse(m) for m in share_mnemonics]
-        share_set = ShareSet(shares)
-        secret = share_set.recover(passphrase)
-        return mnemonic_from_bytes(secret)
-
-
 ShareSet._load()
+
+def slip39_generate_shares(
+    seed, k, n, passphrase=b"", extendable=True, exponent=0, identifier=-1, randint=secure_randint,
+):
+    """
+    Generates a list of SLIP39 mnemonics.
+    Parameters
+    ----------
+    seed: bytes 
+        Random 128 or 256 bit seed.
+    k: int
+        Group threshold.
+    n: int
+        Group size.
+    passphrase: bytes, optional
+        Passphrase used to encrypyt the seed. Default to "".
+    extendable: bool, optionl
+        Enables extendable SLIP39 shamir shares, Default to False.
+    exponent: int, optional
+        Defines iteration exponent for pbkdf2_hmac when seed is encrypted with a passphrase. Default to 0.
+    identifier: int, optional
+        Group identifier, must be between 0 and 32767, if set to -1 a radom value is generated. Default to -1.
+    randint: Callable[[int], [int]], optional
+        A function that takes a lower and upper bound and returns a random value within the bound. Default to embit.misc.secure_randint.
+    
+    Returns
+    -------
+    List[str]
+        A list of SLIP39 share mnemonics.
+    """
+    
+    num_bits = len(seed) * 8
+    if num_bits not in (128, 256):
+        raise ValueError("mnemonic must be 12 or 24 words")
+    # generate id if set to -1
+    id = identifier if identifier > -1 & identifier < 32768 else randint(0, 32767)
+    # encrypt secret with passphrase
+    encrypted = ShareSet.encrypt(seed, id, extendable, exponent, passphrase)
+    # split encrypted payload and create shares
+    shares = []
+    data = ShareSet.split_secret(encrypted, k, n, randint=randint)
+    for group_index, share_bytes in data:
+        share = Share(
+            share_bit_length=num_bits,
+            id=id,
+            extendable=extendable,
+            exponent=exponent,
+            group_index=group_index,
+            group_threshold=k,
+            group_count=n,
+            member_index=0,
+            member_threshold=1,
+            value=int.from_bytes(share_bytes, "big"),
+        )
+        shares.append(share.mnemonic())
+    return shares
+
+def slip39_load_share_set(share_mnemonics):
+    """
+    Load ShareSet.
+    Parameter
+    ---------
+    share_mnemonics: List[str]
+        A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
+    passphrase: bytes, optional
+        Passphrase used to encrypyt the seed. Default to "".
+ 
+    Returns
+    -------
+    ShareSet
+        The loaded ShareSet.
+    """
+    shares = [Share.parse(m) for m in share_mnemonics]
+    return ShareSet(shares)
+
+def slip39_update_shares(
+    share_mnemonics, new_k, new_n, passphrase=b"", randint=secure_randint,
+):
+    """
+    Updates a extendable SLIP39 shamir secret.
+    Parameter
+    --------
+    share_mnemonics: List[str]
+        A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
+    new_k: int
+        New group threshold.
+    new_n: int
+        New group size.
+    passphrase: bytes, optional
+        Passphrase used to encrypyt the seed. Default to "".
+    randint: Callable[[int], [int]], optional
+        A function that takes a lower and upper bound and returns a random value within the bound. Default to embit.misc.secure_randint.
+ 
+    Returns
+    -------
+    List[str]
+        A list of SLIP39 share mnemonics with the updated group parameters.
+    """
+    share_set = slip39_load_share_set(share_mnemonics)
+    if not share_set.extendable:
+        raise ValueError("Cannot update extendable share sets")
+    secret = share_set.recover(passphrase)
+    
+    # generate a new identifier different from the old one
+    new_identifier = share_set.id
+    while new_identifier == share_set.id:
+        new_identifier = randint(0, 32767)
+    return slip39_generate_shares(
+        secret, new_k, new_n, passphrase, True, share_set.exponent, new_identifier, randint
+    )
+
+def slip39_recover_seed(share_mnemonics, passphrase=b""):
+    """
+    Recovers the seed.
+    
+            Parameter
+    --------
+    share_mnemonics: List[str]
+        A list of SLIP39 share mnemonics, number of shares must be equal or bigger then group threshold.
+    passphrase: bytes, optional
+        Passphrase used to encrypyt the seed. Default to "".
+    Returns
+    -------
+    bytes
+        The seed, 128 or 256 bit value.
+    """
+    share_set = slip39_load_share_set(share_mnemonics)
+    return share_set.recover(passphrase)
